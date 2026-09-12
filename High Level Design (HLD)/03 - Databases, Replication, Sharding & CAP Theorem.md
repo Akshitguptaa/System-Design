@@ -1208,8 +1208,62 @@ When your system grows and 4 shards are no longer enough, you add a 5th shard:
 
 Almost every existing record now hashes to a different shard. Rebalancing requires moving massive amounts of data across shards while taking downtime.
 
-**The Solution: Consistent Hashing**
-Consistent hashing ensures that when a new shard/node is added, only `1/N` of the keys need to be remapped and moved rather than the entire dataset (used by Cassandra and DynamoDB).
+#### The Solution: Consistent Hashing (Deep Dive)
+
+Consistent hashing is the elegant solution to the rebalancing problem (used heavily by systems like Cassandra and DynamoDB). Instead of using `hash(key) % number_of_servers`, it maps both servers and keys onto a fixed circular hash space (a ring).
+
+**1. The Hash Ring**
+Imagine a fixed hash space from `0` to `2^32 - 1`. We connect the ends to form a circular ring. The key idea: **The size of this ring is fixed**, whether you have 3 servers or 300 servers.
+
+**2. Placing Servers and Keys on the Ring**
+- **Servers:** We hash each server's ID (e.g., `hash("S1") = 20`) to get a position on the ring.
+- **Keys:** We hash the data key (e.g., `hash("user123") = 35`) to get its position on the same ring.
+
+**3. The Routing Rule**
+To find which server owns a key, we place the key on the ring and **move clockwise until we encounter the first server**.
+This means each server owns the region immediately **counter-clockwise from itself**.
+
+```text
+                 S1 (Position: 20)
+                  /      \
+  Key: user123  /          \
+  (Pos: 35) ── 35          50 ── S2 (Position: 50)
+               \          /
+                 \______/
+```
+In this example, moving clockwise from `35` reaches `50`. So, `user123` goes to `S2`.
+
+**4. Adding or Removing Servers**
+This is where consistent hashing shines.
+- **Adding a server:** If we add `S4` at position `60`, it takes over the range `50 → 60` from `S3`. Only keys falling in this specific range need to move to `S4`. Keys from `60 → 80` stay with `S3`. Keys from `20 → 50` stay with `S2`.
+- **Removing a server:** If `S4` dies, its keys simply shift clockwise to the next server (`S3`). Everything else stays where it was.
+
+**Result:** When a server is added or removed, only its neighboring range changes ownership. Only `1/N` of the keys need to be remapped, rather than almost all of them.
+
+**5. The Uneven Load Problem & Virtual Nodes**
+If we just place physical servers on the ring once, they might not be spaced evenly. For example, `S1` might get 20% of the ring, `S2` gets 10%, and `S3` gets 70%. Ideally, with `N` servers, the load per server should be $\approx \frac{1}{N}$.
+
+**Solution: Virtual Nodes**
+Instead of putting each physical server on the ring *once*, we put it *multiple times*. 
+- `S1` → `S1a`, `S1b`, `S1c`
+- `S2` → `S2a`, `S2b`, `S2c`
+
+We can generate these multiple positions using different hash inputs (e.g., `hash("S1#1")`, `hash("S1#2")`) or multiple independent hash functions (e.g., `H1(S1)`, `H2(S1)`).
+
+```text
+Ring with Virtual Nodes:
+S1a   S2a   S3a   S1b   S2b   S3b   S1c   S3c   S2c
+ ↓     ↓     ↓     ↓     ↓     ↓     ↓     ↓     ↓
+|-----|-----|-----|-----|-----|-----|-----|-----|-----|
+```
+
+**Benefits of Virtual Nodes:**
+1. **Load Balancing:** Each physical server gets many small scattered portions of the ring. The total load averages out to roughly `1/N` per server.
+2. **Graceful Failures:** If `S1` dies, its virtual nodes (`S1a`, `S1b`, `S1c`) disappear. Its load is now taken over by multiple *different* neighboring servers, spreading the burden rather than dumping a massive load onto a single server.
+
+> [!TIP]
+> **One-Line Interview Explanation:**
+> Consistent hashing maps both servers and keys onto a fixed hash ring. A key is assigned to the first server encountered clockwise. When a server is added or removed, only a small portion of keys are remapped. Virtual nodes give each physical server multiple positions on the ring, improving load balance and making the distribution closer to `1/N`.
 
 **3. Geographic/Entity-Based Sharding**
 
